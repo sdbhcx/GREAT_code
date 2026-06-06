@@ -194,8 +194,8 @@ class Text_Encoder(nn.Module):
         super().__init__()
         self.emb_dim = emb_dim
 
-        self.text_encoder = AutoModel.from_pretrained('/PATH/roberta-base')
-        self.tokenizer = AutoTokenizer.from_pretrained('/PATH/roberta-base')
+        self.text_encoder = AutoModel.from_pretrained('/mnt/sdb/wyn/model/roberta-base')
+        self.tokenizer = AutoTokenizer.from_pretrained('/mnt/sdb/wyn/model/roberta-base')
         self.freeze_text_encoder = freeze_text_encoder
         if freeze_text_encoder:
             for p in self.text_encoder.parameters():
@@ -233,8 +233,8 @@ class Text_Encoder2(nn.Module):
         super().__init__()
         self.emb_dim = emb_dim
 
-        self.text_encoder = AutoModel.from_pretrained('/PATH/roberta-base')
-        self.tokenizer = AutoTokenizer.from_pretrained('/PATH/roberta-base')
+        self.text_encoder = AutoModel.from_pretrained('/mnt/sdb/wyn/model/roberta-base')
+        self.tokenizer = AutoTokenizer.from_pretrained('/mnt/sdb/wyn/model/roberta-base')
         self.freeze_text_encoder = freeze_text_encoder
         if freeze_text_encoder:
             for p in self.text_encoder.parameters():

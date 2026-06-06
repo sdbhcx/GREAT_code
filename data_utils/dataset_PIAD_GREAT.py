@@ -8,6 +8,7 @@ from torchvision import transforms
 import pdb
 import json
 import random
+import os
 import matplotlib.pyplot as plt
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -177,16 +178,29 @@ class PIAD(Dataset):
 
     def read_file(self, path, number_dict=None):
         file_list = []
-        with open(path,'r') as f:
+        base_dir = os.path.dirname(path)
+        parent_dir = os.path.dirname(base_dir)
+        with open(path, 'r') as f:
             files = f.readlines()
             for file in files:
                 file = file.strip('\n')
+
+                # 尝试修正相对路径（训练列表中有以 'Data/...' 开头的相对路径）
+                if not os.path.isabs(file) and not os.path.exists(file):
+                    if file.startswith('Data/'):
+                        candidate = os.path.join(parent_dir, file[5:])
+                        if os.path.exists(candidate):
+                            file = candidate
+                    else:
+                        candidate = os.path.join(parent_dir, file)
+                        if os.path.exists(candidate):
+                            file = candidate
+
                 if number_dict != None:
                     object_ = file.split('/')[-4]
                     number_dict[object_] +=1
                 file_list.append(file)
 
-            f.close()
         if number_dict != None:
             return file_list, number_dict
         else:

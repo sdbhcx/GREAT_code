@@ -1,10 +1,10 @@
-res18_pre: 'runs/pre_train/resnet18.pth'
-img_train: 'Data/Unseen_aff/Img_train.txt'
-img_val: 'Data/Unseen_aff/Img_test.txt'
-img_test: 'Data/Unseen_aff/Img_test.txt'
-point_train: 'Data/Unseen_aff/Point_train.txt'
-point_val: 'Data/Unseen_aff/Point_test.txt'
-point_test: 'Data/Unseen_aff/Point_test.txt'
+res18_pre: '/mnt/sdb/wyn/model/resnet18.pth'
+img_train: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Img_train.txt'
+img_val: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Img_test.txt'
+img_test: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Img_test.txt'
+point_train: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Point_train.txt'
+point_val: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Point_test.txt'
+point_test: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Point_test.txt'
 batch_size: 16
 lr: 0.0001
 Epoch: 50
@@ -18,10 +18,10 @@ num_affordance: 24
 pairing_num: 2
 run_type: 'train'
 
-human_dictionary_train: 'Data/Unseen_aff/hk_train.txt'
-human_dictionary_val: 'Data/Unseen_aff/hk_test.txt'
-human_dictionary_test: 'Data/Unseen_aff/hk_test.txt'
+human_dictionary_train: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/hk_train.txt'
+human_dictionary_val: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/hk_test.txt'
+human_dictionary_test: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/hk_test.txt'
 
-object_dictionary_train: 'Data/Unseen_aff/ok_train.txt'
-object_dictionary_val: 'Data/Unseen_aff/ok_test.txt'
-object_dictionary_test: 'Data/Unseen_aff/ok_test.txt'
+object_dictionary_train: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/ok_train.txt'
+object_dictionary_val: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/ok_test.txt'
+object_dictionary_test: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/ok_test.txt'

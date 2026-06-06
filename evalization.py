@@ -267,7 +267,7 @@ if __name__=='__main__':
     parser.add_argument('--checkpoint_path', type=str, default='runs/GREAT/best_seen.pt', help='checkpoint path')
     parser.add_argument('--yaml', type=str, default='config/config_seen_GREAT.yaml', help='yaml path')
     parser.add_argument('--log_name', type=str, default='evalization_seen.log', help='save the results')
-    parser.add_argument('--save_dir', type=str, default='/runs/', help='path to save .pt model while training')
+    parser.add_argument('--save_dir', type=str, default='./runs/', help='path to save .pt model while training')
     parser.add_argument('--name', type=str, default='GREAT', help='training name to classify each training process')
        
 
