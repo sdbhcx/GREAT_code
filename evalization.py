@@ -1,8 +1,8 @@
 import torch
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
-from data_utils.dataset_PIAD_GREAT import PIAD
-from model.GREAT import GREAT
+from data_utils.dataset_PIAD_GREAT import PIAD, PIAD_L2, PIAD_L3
+from model.GREAT import GREAT, GREAT_L2, GREAT_L3
 from utils.eval import SIM
 from numpy import nan
 import numpy as np
@@ -78,13 +78,28 @@ def Evalization(dataset, data_loader, model_path, use_gpu, Setting):
     for aff in Affordance_list:
         exec(f'{aff} = [[], [], [], []]')
 
-    model = GREAT(pre_train=False)
+    is_l2 = (getattr(opt, 'mode', 'base') == 'l2')
+    is_l3 = (getattr(opt, 'mode', 'base') == 'l3')
+    if is_l2:
+        model = GREAT_L2(vlm_dim=dataset.vis_dim, pre_train=False)
+    elif is_l3:
+        model = GREAT_L3(vlm_dim=dataset.vis_dim, pre_train=False)
+    else:
+        model = GREAT(pre_train=False)
 
     model = model.to(device)
     model = torch.nn.parallel.DistributedDataParallel(model.cuda(), device_ids=[local_rank], find_unused_parameters=True, broadcast_buffers=False)
-   
+
     checkpoint = torch.load(model_path, map_location='cuda:0')
-    model.load_state_dict(checkpoint['model'])
+    if is_l2 or is_l3:
+        # L2/L3 ckpts are saved unwrapped (model.module.state_dict(), no 'module.'
+        # prefix); load into the inner module to avoid a DDP prefix mismatch.
+        state = checkpoint['model'] if 'model' in checkpoint else checkpoint
+        if any(k.startswith('module.') for k in state.keys()):
+            state = {k.replace('module.', '', 1): v for k, v in state.items()}
+        model.module.load_state_dict(state)
+    else:
+        model.load_state_dict(checkpoint['model'])
     model = model.to(device)
   
     results = torch.zeros((len(dataset), 2048, 1))
@@ -111,8 +126,15 @@ def Evalization(dataset, data_loader, model_path, use_gpu, Setting):
                 img = img.to(device)
                 point = point.to(device)
                 label = label.to(device)
-        
-            pred = model(img, point, text_hd, text_od)
+
+            if is_l2:
+                vis_emb = text_hd.float().to(device)
+                pred = model(img, point, vis_emb)
+            elif is_l3:
+                vis_feat = text_hd.float().to(device)
+                pred = model(img, point, vis_feat)[0]
+            else:
+                pred = model(img, point, text_hd, text_od)
 
             pred_num = pred.shape[0]
             print(f'num:{num}, pred_num:{pred_num}')
@@ -243,7 +265,6 @@ def run(opt):
     dict = read_yaml(opt.yaml)
     point_path = dict['point_test']
     img_path = dict['img_test']
-    text_path = dict['text_test']
     text_hd_val_path = dict['human_dictionary_test']
     text_od_val_path = dict['object_dictionary_test']   
 
@@ -252,7 +273,16 @@ def run(opt):
     if opt.use_gpu:
         dist.init_process_group(backend='nccl', init_method='env://')
 
-    val_dataset = PIAD('val', dict['Setting'], point_path, img_path, text_hd_val_path, text_od_val_path)
+    if getattr(opt, 'mode', 'base') == 'l2':
+        vis_emb_test = dict['vis_emb_test']
+        val_dataset = PIAD_L2('val', dict['Setting'], point_path, img_path,
+                              text_hd_val_path, text_od_val_path, vis_emb_test)
+    elif getattr(opt, 'mode', 'base') == 'l3':
+        vis_feat_test = dict['vis_feat_test']
+        val_dataset = PIAD_L3('val', dict['Setting'], point_path, img_path,
+                              text_hd_val_path, text_od_val_path, vis_feat_test)
+    else:
+        val_dataset = PIAD('val', dict['Setting'], point_path, img_path, text_hd_val_path, text_od_val_path)
     val_sampler = DistributedSampler(val_dataset)
     val_loader = DataLoader(val_dataset, dict['batch_size'], sampler=val_sampler, num_workers=8)
     #val_loader = DataLoader(val_dataset, dict['batch_size'], num_workers=8)
@@ -261,15 +291,15 @@ def run(opt):
 if __name__=='__main__':
 
     parser = argparse.ArgumentParser()
-
     #parser.add_argument('--gpu', type=str, default='cuda:0', help='gpu device id')
     parser.add_argument('--use_gpu', type=str, default=True, help='whether or not use gpus')
     parser.add_argument('--checkpoint_path', type=str, default='runs/GREAT/best_seen.pt', help='checkpoint path')
-    parser.add_argument('--yaml', type=str, default='config/config_seen_GREAT.yaml', help='yaml path')
-    parser.add_argument('--log_name', type=str, default='evalization_seen.log', help='save the results')
+    parser.add_argument('--yaml', type=str, default='config/config_unseen_obj_GREAT.yaml', help='yaml path')
+    parser.add_argument('--log_name', type=str, default='evalization_obj_unseen.log', help='save the results')
     parser.add_argument('--save_dir', type=str, default='./runs/', help='path to save .pt model while training')
     parser.add_argument('--name', type=str, default='GREAT', help='training name to classify each training process')
-       
+    parser.add_argument('--mode', type=str, default='base', choices=['base', 'l2', 'l3'], help='base = original GREAT; l2 = visual-intent embedding swap; l3 = visual-grounded MHACoT')
+
 
     opt = parser.parse_args()
     seed_torch(42)

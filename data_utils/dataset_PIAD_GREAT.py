@@ -218,7 +218,132 @@ class PIAD(Dataset):
         cut_str = str.split('/')
         affordance = cut_str[-2]
         index = self.affordance_label_list.index(affordance)
-        
+
         return  index
-    
- 
+
+
+class PIAD_L2(PIAD):
+    """Level 2 dataset: replaces the two text strings (text_hd / text_od) with a
+    single frozen Qwen2.5-VL visual-intent embedding per image.
+
+    `vis_emb_path` is the .npy written by level2_extract_vis_emb.py; its sibling
+    <prefix>.vis_emb.json holds {index: {abs_img_path: row}}. Lookup is by the
+    resolved absolute image path (self.img_files[index]), exactly the string the
+    extractor keyed on. A miss raises (fail-loud) so a stale/mismatched cache can
+    never silently degrade a run.
+
+    The returned tuple keeps PIAD's layout but slots 1 and 2 now carry the SAME
+    float32 vis_emb tensor [D] (instead of text_hd / text_od strings); GREAT_L2
+    only reads one of them. Default collate stacks [D] -> [B, D].
+    """
+
+    def __init__(self, run_type, setting_type, point_path, img_path,
+                 text_hk_path, text_ok_path, vis_emb_path, pair=2, img_size=(224, 224)):
+        super().__init__(run_type, setting_type, point_path, img_path,
+                         text_hk_path, text_ok_path, pair, img_size)
+        npy_path = vis_emb_path
+        json_path = vis_emb_path[:-len('.npy')] + '.json' if vis_emb_path.endswith('.npy') \
+            else vis_emb_path + '.json'
+        self.vis_emb = np.load(npy_path).astype(np.float32)
+        with open(json_path, 'r') as f:
+            meta = json.load(f)
+        self.vis_index = meta['index']          # abs_img_path -> row
+        self.vis_dim = int(meta.get('dim', self.vis_emb.shape[1]))
+
+    def _lookup_emb(self, img_path):
+        row = self.vis_index.get(img_path)
+        if row is None:
+            # fall back to basename match (path roots can differ across machines)
+            base = os.path.basename(img_path)
+            for p, r in self.vis_index.items():
+                if os.path.basename(p) == base:
+                    row = r
+                    break
+        if row is None:
+            raise KeyError(f"[PIAD_L2] no vis_emb cached for image: {img_path}")
+        return torch.from_numpy(self.vis_emb[row]).float()
+
+    def __getitem__(self, index):
+        out = list(super().__getitem__(index))
+        img_path = self.img_files[index]
+        emb = self._lookup_emb(img_path)
+        out[1] = emb
+        out[2] = emb
+        return tuple(out)
+
+
+class PIAD_L3(PIAD):
+    """Level 3 dataset: replaces the two text strings (text_hd / text_od) with a
+    frozen Qwen2.5-VL visual feature *map* per image (a token sequence, not the
+    single pooled vector L2 used).
+
+    `vis_feat_path` is the .npy written by level3_extract_vis_feat.py with shape
+    [N, M, D]; its sibling <prefix>.vis_feat.json holds {index:{abs_img_path:row}}.
+    Lookup is by the resolved absolute image path (self.img_files[index]) with a
+    basename fallback, then fail-loud — identical policy to PIAD_L2.
+
+    The returned tuple keeps PIAD's layout but slots 1 and 2 now carry the SAME
+    float32 feature map [M, D] (GREAT_L3 only reads one). Default collate stacks
+    [M, D] -> [B, M, D].
+    """
+
+    def __init__(self, run_type, setting_type, point_path, img_path,
+                 text_hk_path, text_ok_path, vis_feat_path, pair=2, img_size=(224, 224)):
+        super().__init__(run_type, setting_type, point_path, img_path,
+                         text_hk_path, text_ok_path, pair, img_size)
+        npy_path = vis_feat_path
+        json_path = vis_feat_path[:-len('.npy')] + '.json' if vis_feat_path.endswith('.npy') \
+            else vis_feat_path + '.json'
+        self.vis_feat = np.load(npy_path).astype(np.float32)     # [N, M, D]
+        with open(json_path, 'r') as f:
+            meta = json.load(f)
+        self.vis_index = meta['index']          # abs_img_path -> row
+        self.vis_dim = int(meta.get('dim', self.vis_feat.shape[2]))
+        self.n_tokens = int(meta.get('n_tokens', self.vis_feat.shape[1]))
+
+    def _lookup_feat(self, img_path):
+        row = self.vis_index.get(img_path)
+        if row is None:
+            base = os.path.basename(img_path)
+            for p, r in self.vis_index.items():
+                if os.path.basename(p) == base:
+                    row = r
+                    break
+        if row is None:
+            raise KeyError(f"[PIAD_L3] no vis_feat cached for image: {img_path}")
+        return torch.from_numpy(self.vis_feat[row]).float()      # [M, D]
+
+    def __getitem__(self, index):
+        out = list(super().__getitem__(index))
+        img_path = self.img_files[index]
+        feat = self._lookup_feat(img_path)
+        out[1] = feat
+        out[2] = feat
+        return tuple(out)
+
+
+class PIAD_L3_Online(PIAD):
+    """Level 3 (LoRA) dataset: no offline cache. Instead of a feature map, slots
+    1 and 2 carry the resolved absolute image path and the object category string,
+    so the training loop can run Qwen2.5-VL online (with LoRA in the graph) and
+    extract the visual feature map per batch.
+
+    The default DataLoader collate leaves strings as a tuple, so slots 1/2 arrive
+    in the loop as `(img_path_0, ...)` / `(object_0, ...)` — `build_qwen_inputs`
+    in train.py turns them into Qwen processor tensors. The object is parsed
+    exactly like MHACoT.py / level3_extract_vis_feat.py: `img_path.split('/')[-4]`.
+    """
+
+    def __init__(self, run_type, setting_type, point_path, img_path,
+                 text_hk_path, text_ok_path, pair=2, img_size=(224, 224)):
+        super().__init__(run_type, setting_type, point_path, img_path,
+                         text_hk_path, text_ok_path, pair, img_size)
+
+    def __getitem__(self, index):
+        out = list(super().__getitem__(index))
+        img_path = self.img_files[index]
+        obj = img_path.split('/')[-4]
+        out[1] = img_path
+        out[2] = obj
+        return tuple(out)
+

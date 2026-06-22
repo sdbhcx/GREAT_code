@@ -1,0 +1,37 @@
+res18_pre: '/mnt/sdb/wyn/model/resnet18.pth'
+img_train: '/mnt/sdb/wyn/data/PIAD/Seen/Img_train.txt'
+img_val: '/mnt/sdb/wyn/data/PIAD/Seen/Img_val.txt'
+img_test: '/mnt/sdb/wyn/data/PIAD/Seen/Img_test.txt'
+point_train: '/mnt/sdb/wyn/data/PIAD/Seen/Point_train.txt'
+point_val: '/mnt/sdb/wyn/data/PIAD/Seen/Point_val.txt'
+point_test: '/mnt/sdb/wyn/data/PIAD/Seen/Point_test.txt'
+batch_size: 16
+lr: 0.0001
+Epoch: 65
+Setting: 'Seen'
+num_heads: 4
+emb_dim: 512
+proj_dim: 512
+N_p: 64
+N_raw: 2048
+num_affordance: 24
+pairing_num: 2
+run_type: 'train'
+
+human_dictionary_train: '/mnt/sdb/wyn/data/PIAD/Seen/hk_train.txt'
+human_dictionary_val: '/mnt/sdb/wyn/data/PIAD/Seen/hk_val.txt'
+human_dictionary_test: '/mnt/sdb/wyn/data/PIAD/Seen/hk_test.txt'
+
+object_dictionary_train: '/mnt/sdb/wyn/data/PIAD/Seen/ok_train.txt'
+object_dictionary_val: '/mnt/sdb/wyn/data/PIAD/Seen/ok_val.txt'
+object_dictionary_test: '/mnt/sdb/wyn/data/PIAD/Seen/ok_test.txt'
+
+# Level 3 — visual-grounded MHACoT + consistency loss
+lambda_cons: 0.1
+
+# Frozen Qwen2.5-VL visual feature map cache [N, M, D]
+# (produced by great_hammer_exp/scripts/level3_extract_vis_feat.py)
+# Seen has a distinct val split, so train + val + test are all extracted.
+vis_feat_train: 'great_hammer_exp/out_level3/seen_train.vis_feat.npy'
+vis_feat_val: 'great_hammer_exp/out_level3/seen_val.vis_feat.npy'
+vis_feat_test: 'great_hammer_exp/out_level3/seen_test.vis_feat.npy'

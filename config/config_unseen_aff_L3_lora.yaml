@@ -1,0 +1,36 @@
+res18_pre: '/mnt/sdb/wyn/model/resnet18.pth'
+img_train: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Img_train.txt'
+img_val: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Img_test.txt'
+img_test: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Img_test.txt'
+point_train: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Point_train.txt'
+point_val: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Point_test.txt'
+point_test: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/Point_test.txt'
+batch_size: 2
+lr: 0.0001
+Epoch: 50
+Setting: 'Unseen_aff'
+num_heads: 4
+emb_dim: 512
+proj_dim: 512
+N_p: 64
+N_raw: 2048
+num_affordance: 24
+pairing_num: 2
+run_type: 'train'
+
+human_dictionary_train: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/hk_train.txt'
+human_dictionary_val: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/hk_test.txt'
+human_dictionary_test: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/hk_test.txt'
+
+object_dictionary_train: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/ok_train.txt'
+object_dictionary_val: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/ok_test.txt'
+object_dictionary_test: '/mnt/sdb/wyn/data/PIAD/Unseen_aff/ok_test.txt'
+
+# Level 3 (LoRA) — online Qwen2.5-VL in the training graph.
+# No vis_feat cache: the VLM runs each step so gradients reach the LoRA adapter.
+lambda_cons: 0.1
+
+# Frozen Qwen2.5-VL base (vision tower frozen, q_proj/v_proj get LoRA)
+vlm_model_id: '/mnt/sdb/wyn/model/modelscope/qwen2.5-vl-7b/Qwen/Qwen2___5-VL-7B-Instruct'
+# LoRA adapter learning rate (GREAT downstream uses `lr` above)
+vlm_lr: 0.0002

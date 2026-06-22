@@ -220,10 +220,18 @@ class Text_Encoder(nn.Module):
             tokenized_phrases = tokenized_phrases.to(device)
             outputs = self.text_encoder(**tokenized_phrases)
             pooled_output = outputs.pooler_output
-            resized_phrases = self.text_resizer(pooled_output)
+            resized_phrases = self.text_resizer(pooled_output)  # [n_phrases, emb_dim]
+            # img_text_fusion.reshape has Linear(3, ...) — must be exactly 3 phrases.
+            # Original data always has 3; CoT strings may have fewer or more commas.
+            n, d = resized_phrases.shape
+            if n < 3:
+                pad = resized_phrases.new_zeros(3 - n, d)
+                resized_phrases = torch.cat([resized_phrases, pad], dim=0)
+            elif n > 3:
+                resized_phrases = resized_phrases[:3]
             all_encoded_text.append(resized_phrases)
 
-        text_embeddings = torch.stack(all_encoded_text)  
+        text_embeddings = torch.stack(all_encoded_text)
 
         return text_embeddings
 
@@ -339,34 +347,40 @@ class Decoder(nn.Module):
             nn.BatchNorm1d(self.emb_dim),
             nn.ReLU()
         )  
-    def forward(self, T_o, I_h, encoder_p):
+    def forward(self, T_o, I_h, encoder_p, return_feat=False):
 
         '''
-        T_o --->object knowledge embedding       
+        T_o --->object knowledge embedding
         I_h ---> [B, N_i, C]
         encoder_p  ---> [Hierarchy feature]
+        return_feat ---> if True, also return the pooled mid-feature h_aff [B, emb]
+                         (Level-3 consistency loss). Default False keeps GREAT /
+                         GREAT_L2 output byte-identical.
         '''
         B, _, _ = I_h.shape
 
-        p_0, p_1, p_2, p_3 = encoder_p  
+        p_0, p_1, p_2, p_3 = encoder_p
 
-        p_3[1] = self.cmff(T_o, p_3[1].transpose(-2, -1))     
-        up_sample = self.fp3(p_2[0], p_3[0], p_2[1], p_3[1])   
-        
+        p_3[1] = self.cmff(T_o, p_3[1].transpose(-2, -1))
+        up_sample = self.fp3(p_2[0], p_3[0], p_2[1], p_3[1])
 
-        up_sample = self.fp2(p_1[0], p_2[0], p_1[1], up_sample)    
-        
-       
-        up_sample = self.fp1(p_0[0], p_1[0], torch.cat([p_0[0], p_0[1]],1), up_sample) 
-        
-        F_I = self.reshape(I_h.permute(0,2,1))  
+
+        up_sample = self.fp2(p_1[0], p_2[0], p_1[1], up_sample)
+
+
+        up_sample = self.fp1(p_0[0], p_1[0], torch.cat([p_0[0], p_0[1]],1), up_sample)
+
+        F_I = self.reshape(I_h.permute(0,2,1))
 
         F_j = torch.cat((F_I, up_sample),dim=1)
-        F_j_fusion = self.fusion(F_j)        
+        F_j_fusion = self.fusion(F_j)
 
-        _3daffordance = self.out_head(F_j_fusion.permute(0, 2, 1))                   
+        _3daffordance = self.out_head(F_j_fusion.permute(0, 2, 1))
         _3daffordance = self.sigmoid(_3daffordance)
 
+        if return_feat:
+            h_aff = F_j_fusion.mean(dim=-1)          # [B, emb] pooled over points
+            return _3daffordance, h_aff
         return _3daffordance
 
 class GREAT(nn.Module):
@@ -437,9 +451,416 @@ class GREAT(nn.Module):
 
 def get_GREAT(img_model_path=None, pre_train = True, normal_channel=False, local_rank=None,
     N_p = 64, emb_dim = 512, proj_dim = 512, num_heads = 4, freeze_text_encoder = True):
-    
+
     model = GREAT(img_model_path, pre_train, normal_channel, local_rank,
     N_p, emb_dim, proj_dim, num_heads, freeze_text_encoder)
+    return model
+
+
+# =============================================================================
+# Level 2 — visual-intent embedding swap
+#
+# Replaces GREAT's text-encoder branch (Text_Encoder / Text_Encoder2 producing
+# T_h [B,3,emb] and T_o [B,1,emb]) with a trainable projection MLP fed by a
+# frozen Qwen2.5-VL "visual intent" embedding (one [B, vlm_dim] vector per
+# image, cached offline by level2_extract_vis_emb.py).
+#
+# Everything downstream of the text branch (affordance_dictionary_fusion,
+# img_text_fusion, decoder) is byte-identical to GREAT, so the B0 checkpoint
+# loads into those submodules with strict=False and stays frozen during L2
+# training — only `intent_proj` learns.
+# =============================================================================
+
+class IntentProj(nn.Module):
+    """Frozen-VLM visual intent embedding -> GREAT's (T_h', T_o') text slots.
+
+    Input : vis_emb [B, vlm_dim]
+    Output: T_h' [B, 3, emb_dim]   (human/affordance knowledge, mirrors T_h)
+            T_o' [B, 1, emb_dim]   (object knowledge,            mirrors T_o)
+
+    The 3 / 1 token counts are mandatory: img_text_fusion.reshape expects
+    exactly 3 phrase tokens (Linear(3, ...)) and the decoder consumes a single
+    object-knowledge token.
+    """
+    def __init__(self, vlm_dim, emb_dim=512, n_hk=3, n_ok=1):
+        super().__init__()
+        self.vlm_dim = vlm_dim
+        self.emb_dim = emb_dim
+        self.n_hk = n_hk
+        self.n_ok = n_ok
+
+        self.trunk = nn.Sequential(
+            nn.Linear(vlm_dim, emb_dim),
+            nn.GELU(),
+        )
+        self.hk_head = nn.Linear(emb_dim, n_hk * emb_dim)
+        self.ok_head = nn.Linear(emb_dim, n_ok * emb_dim)
+        self.hk_norm = nn.LayerNorm(emb_dim)
+        self.ok_norm = nn.LayerNorm(emb_dim)
+
+    def forward(self, vis_emb):
+        B = vis_emb.size(0)
+        h = self.trunk(vis_emb)                                   # [B, emb]
+        T_h = self.hk_head(h).view(B, self.n_hk, self.emb_dim)    # [B, 3, emb]
+        T_o = self.ok_head(h).view(B, self.n_ok, self.emb_dim)    # [B, 1, emb]
+        T_h = self.hk_norm(T_h)
+        T_o = self.ok_norm(T_o)
+        return T_h, T_o
+
+
+class GREAT_L2(nn.Module):
+    """GREAT with the text branch replaced by IntentProj.
+
+    Submodules img_encoder / point_encoder / affordance_dictionary_fusion /
+    img_text_fusion / decoder are named identically to GREAT so that a B0
+    GREAT checkpoint loads into them with strict=False.
+    """
+    def __init__(self, vlm_dim, img_model_path=None, pre_train=False, normal_channel=False,
+                 local_rank=None, N_p=64, emb_dim=512, proj_dim=512, num_heads=4):
+        super().__init__()
+
+        self.emb_dim = emb_dim
+        self.N_p = N_p
+        self.proj_dim = proj_dim
+        self.num_heads = num_heads
+        self.local_rank = local_rank
+        self.normal_channel = normal_channel
+        self.additional_channel = 3 if self.normal_channel else 0
+
+        self.img_encoder = Img_Encoder()
+        if pre_train and img_model_path is not None:
+            pretrain_dict = torch.load(img_model_path)
+            img_model_dict = self.img_encoder.state_dict()
+            for k in list(pretrain_dict.keys()):
+                new_key = 'model.' + k
+                pretrain_dict[new_key] = pretrain_dict.pop(k)
+            pretrain_dict = {k: v for k, v in pretrain_dict.items() if k in img_model_dict}
+            img_model_dict.update(pretrain_dict)
+            self.img_encoder.load_state_dict(img_model_dict)
+
+        self.point_encoder = Point_Encoder(self.emb_dim, self.normal_channel, self.additional_channel, self.N_p)
+        self.affordance_dictionary_fusion = affordance_dictionary_fusion(self.emb_dim, self.proj_dim, self.num_heads)
+        self.img_text_fusion = img_text_fusion(self.emb_dim, self.proj_dim)
+        self.decoder = Decoder(self.additional_channel, self.emb_dim, self.proj_dim)
+
+        # the only trainable branch in L2
+        self.intent_proj = IntentProj(vlm_dim, emb_dim=self.emb_dim)
+
+    def forward(self, img, xyz, vis_emb):
+        '''
+        img:     [B, 3, H, W]
+        xyz:     [B, 3, 2048]
+        vis_emb: [B, vlm_dim]  frozen Qwen2.5-VL visual intent embedding
+        '''
+        B, C, N = xyz.size()
+        F_I = self.img_encoder(img)
+        F_i = F_I.view(B, self.emb_dim, -1)
+
+        F_p_wise = self.point_encoder(xyz)
+
+        T_h, T_o = self.intent_proj(vis_emb)            # [B,3,emb], [B,1,emb]
+
+        T_h_, T_o_ = self.affordance_dictionary_fusion(T_h, T_o)
+        I_h = self.img_text_fusion(F_i, T_h_)
+
+        _3daffordance = self.decoder(T_o_, I_h.permute(0, 2, 1), F_p_wise)
+        return _3daffordance
+
+
+def get_GREAT_L2(vlm_dim, img_model_path=None, pre_train=False, normal_channel=False,
+                 local_rank=None, N_p=64, emb_dim=512, proj_dim=512, num_heads=4):
+    model = GREAT_L2(vlm_dim, img_model_path, pre_train, normal_channel, local_rank,
+                     N_p, emb_dim, proj_dim, num_heads)
+    return model
+
+
+# =============================================================================
+# Level 3 — visual-grounded MHACoT + consistency loss (end-to-end)
+#
+# Unlike L2 (a single mean-pooled VLM vector -> tiny MLP, frozen backbone), L3
+# queries a *visual feature map* V [B, M, vlm_dim] (the image-token subsequence
+# of a frozen Qwen2.5-VL last hidden state under the MHACoT intent prompt,
+# cached offline by level3_extract_vis_feat.py) with 4 learnable step tokens via
+# cross-attention. The 4 steps mirror the MHACoT chain Q1-Q4 and are routed to
+# GREAT's two knowledge slots:
+#     Q1,Q2 -> ok_head -> T_o [B,1,emb]  (object knowledge)
+#     Q3,Q4 -> hk_head -> T_h [B,3,emb]  (human/affordance knowledge)
+# Everything downstream (CMAFM, img_text_fusion, decoder) is named identically
+# to GREAT so the B0 checkpoint warm-starts those submodules (strict=False);
+# in L3 ALL weights then train end-to-end. The decoder additionally exposes a
+# pooled mid-feature h_aff for L_consistency = 1 - cos(e_hk, h_aff).
+# =============================================================================
+
+class VisualMHACoT(nn.Module):
+    """4-step visual reasoning chain over the cached VLM feature map.
+
+    Input : V     [B, M, vlm_dim]   frozen Qwen2.5-VL image-token features
+    Output: T_h   [B, n_hk, emb]    human/affordance knowledge (mirrors GREAT T_h)
+            T_o   [B, n_ok, emb]    object knowledge            (mirrors GREAT T_o)
+            e_hk  [B, emb]          pooled affordance/human embedding (consistency)
+
+    The 3/1 token counts are mandatory: img_text_fusion.reshape expects exactly
+    3 phrase tokens (Linear(3,...)) and the decoder consumes one object token.
+    """
+    def __init__(self, vlm_dim, emb_dim=512, n_steps=4, num_heads=4, n_hk=3, n_ok=1):
+        super().__init__()
+        self.vlm_dim = vlm_dim
+        self.emb_dim = emb_dim
+        self.n_steps = n_steps
+        self.n_hk = n_hk
+        self.n_ok = n_ok
+
+        self.v_proj = nn.Linear(vlm_dim, emb_dim)
+        self.v_norm = nn.LayerNorm(emb_dim)
+
+        # one learnable query token per MHACoT step (Q1 part / Q2 geom /
+        # Q3 current interaction / Q4 additional interactions)
+        self.step_tokens = nn.Parameter(torch.randn(n_steps, emb_dim) * 0.02)
+
+        self.cross_attn = nn.MultiheadAttention(emb_dim, num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(emb_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.GELU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+        self.norm2 = nn.LayerNorm(emb_dim)
+
+        # route pooled (Q1,Q2)->object and (Q3,Q4)->human/affordance
+        self.ok_head = nn.Linear(2 * emb_dim, n_ok * emb_dim)
+        self.hk_head = nn.Linear(2 * emb_dim, n_hk * emb_dim)
+        self.ok_norm = nn.LayerNorm(emb_dim)
+        self.hk_norm = nn.LayerNorm(emb_dim)
+
+    def forward(self, V, key_padding_mask=None):
+        '''
+        V                : [B, M, vlm_dim]
+        key_padding_mask : [B, M] bool, True = padded (ignored) key position.
+                           None -> all keys valid (offline L3 behaviour unchanged).
+        '''
+        B = V.size(0)
+        Vp = self.v_norm(self.v_proj(V))                          # [B, M, emb]
+
+        q = self.step_tokens.unsqueeze(0).expand(B, -1, -1)       # [B, 4, emb]
+        attn_out, _ = self.cross_attn(q, Vp, Vp,
+                                      key_padding_mask=key_padding_mask)  # [B, 4, emb]
+        s = self.norm1(q + attn_out)
+        s = self.norm2(s + self.ffn(s))                           # [B, 4, emb]
+
+        ok_in = torch.cat([s[:, 0], s[:, 1]], dim=-1)            # [B, 2*emb]
+        hk_in = torch.cat([s[:, 2], s[:, 3]], dim=-1)            # [B, 2*emb]
+
+        T_o = self.ok_norm(self.ok_head(ok_in).view(B, self.n_ok, self.emb_dim))
+        T_h = self.hk_norm(self.hk_head(hk_in).view(B, self.n_hk, self.emb_dim))
+
+        e_hk = s[:, 2:4].mean(dim=1)                              # [B, emb]
+        return T_h, T_o, e_hk
+
+
+class GREAT_L3(nn.Module):
+    """GREAT with the text branch replaced by VisualMHACoT, trained end-to-end.
+
+    Submodules img_encoder / point_encoder / affordance_dictionary_fusion /
+    img_text_fusion / decoder are named identically to GREAT so a B0 checkpoint
+    warm-starts them with strict=False. Unlike L2 nothing is frozen here.
+    """
+    def __init__(self, vlm_dim, img_model_path=None, pre_train=False, normal_channel=False,
+                 local_rank=None, N_p=64, emb_dim=512, proj_dim=512, num_heads=4):
+        super().__init__()
+
+        self.emb_dim = emb_dim
+        self.N_p = N_p
+        self.proj_dim = proj_dim
+        self.num_heads = num_heads
+        self.local_rank = local_rank
+        self.normal_channel = normal_channel
+        self.additional_channel = 3 if self.normal_channel else 0
+
+        self.img_encoder = Img_Encoder()
+        if pre_train and img_model_path is not None:
+            pretrain_dict = torch.load(img_model_path)
+            img_model_dict = self.img_encoder.state_dict()
+            for k in list(pretrain_dict.keys()):
+                new_key = 'model.' + k
+                pretrain_dict[new_key] = pretrain_dict.pop(k)
+            pretrain_dict = {k: v for k, v in pretrain_dict.items() if k in img_model_dict}
+            img_model_dict.update(pretrain_dict)
+            self.img_encoder.load_state_dict(img_model_dict)
+
+        self.point_encoder = Point_Encoder(self.emb_dim, self.normal_channel, self.additional_channel, self.N_p)
+        self.affordance_dictionary_fusion = affordance_dictionary_fusion(self.emb_dim, self.proj_dim, self.num_heads)
+        self.img_text_fusion = img_text_fusion(self.emb_dim, self.proj_dim)
+        self.decoder = Decoder(self.additional_channel, self.emb_dim, self.proj_dim)
+
+        # visual-grounded reasoning chain (new in L3)
+        self.visual_mhacot = VisualMHACoT(vlm_dim, emb_dim=self.emb_dim, num_heads=self.num_heads)
+
+    def forward(self, img, xyz, vis_feat):
+        '''
+        img:      [B, 3, H, W]
+        xyz:      [B, 3, 2048]
+        vis_feat: [B, M, vlm_dim]  frozen Qwen2.5-VL visual feature map
+        returns:  (pred [B,2048,1], e_hk [B,emb], h_aff [B,emb])
+        '''
+        B, C, N = xyz.size()
+        F_I = self.img_encoder(img)
+        F_i = F_I.view(B, self.emb_dim, -1)
+
+        F_p_wise = self.point_encoder(xyz)
+
+        T_h, T_o, e_hk = self.visual_mhacot(vis_feat)
+
+        T_h_, T_o_ = self.affordance_dictionary_fusion(T_h, T_o)
+        I_h = self.img_text_fusion(F_i, T_h_)
+
+        pred, h_aff = self.decoder(T_o_, I_h.permute(0, 2, 1), F_p_wise, return_feat=True)
+        return pred, e_hk, h_aff
+
+
+def get_GREAT_L3(vlm_dim, img_model_path=None, pre_train=False, normal_channel=False,
+                 local_rank=None, N_p=64, emb_dim=512, proj_dim=512, num_heads=4):
+    model = GREAT_L3(vlm_dim, img_model_path, pre_train, normal_channel, local_rank,
+                     N_p, emb_dim, proj_dim, num_heads)
+    return model
+
+
+# =============================================================================
+# Level 3 (LoRA) — online Qwen2.5-VL in the training graph
+#
+# Unlike offline L3 (frozen Qwen, cached vis_feat.npy), here the (LoRA-wrapped)
+# Qwen runs inside forward so gradients reach the adapters. We take the
+# image-token subsequence of the last hidden state as the visual feature map V,
+# pad it to the batch max with a key_padding_mask, and feed VisualMHACoT exactly
+# as offline L3 does. Everything downstream is the same GREAT stack (warm-started
+# from B0); the Qwen base stays frozen, only its LoRA delta + the GREAT side
+# (visual_mhacot + img/point/fusion/decoder) train.
+#
+# The Qwen forward and the GREAT decode are split into two methods (encode_vlm /
+# decode) so the loop can run Qwen ONCE per image and reuse V across the
+# pairing_num point clouds. Runs single-GPU (no DDP) — a 7B base barely fits one
+# 24GB card.
+# =============================================================================
+
+def _gather_image_tokens(hidden, input_ids, image_token_id):
+    """Per-sample, select the image-token positions of `hidden` and pad to the
+    batch max.
+
+    hidden        : [B, T, D]   last hidden state
+    input_ids     : [B, T]      token ids (same T, padded by the processor)
+    image_token_id: int
+
+    Returns
+        V    : [B, Mmax, D]  image-token features, zero-padded
+        mask : [B, Mmax]     bool, True = padded (ignored) position
+    If a sample has no image token (unexpected), falls back to all its tokens so
+    the map is never empty.
+    """
+    B, T, D = hidden.shape
+    sel = (input_ids == image_token_id)                  # [B, T]
+    rows = []
+    counts = []
+    for b in range(B):
+        s = sel[b]
+        if not bool(s.any()):
+            s = torch.ones(T, dtype=torch.bool, device=hidden.device)
+        rows.append(hidden[b][s])                        # [m_b, D]
+        counts.append(rows[-1].shape[0])
+    Mmax = max(counts)
+    V = hidden.new_zeros(B, Mmax, D)
+    mask = torch.ones(B, Mmax, dtype=torch.bool, device=hidden.device)  # True=pad
+    for b, (r, m) in enumerate(zip(rows, counts)):
+        V[b, :m] = r
+        mask[b, :m] = False
+    return V, mask
+
+
+class GREAT_L3_LoRA(nn.Module):
+    """GREAT_L3 with an online (LoRA) Qwen2.5-VL instead of a cached feature map.
+
+    `vlm` is the already-LoRA-wrapped Qwen model, built and frozen-except-LoRA in
+    train.py (mirrors Hammer). The GREAT submodules are named identically to
+    GREAT so a B0 checkpoint warm-starts them (strict=False); the vlm.* keys are
+    simply absent from B0.
+    """
+    def __init__(self, vlm, vlm_dim, image_token_id, img_model_path=None, pre_train=False,
+                 normal_channel=False, local_rank=None, N_p=64, emb_dim=512,
+                 proj_dim=512, num_heads=4):
+        super().__init__()
+
+        self.vlm = vlm
+        self.image_token_id = image_token_id
+
+        self.emb_dim = emb_dim
+        self.N_p = N_p
+        self.proj_dim = proj_dim
+        self.num_heads = num_heads
+        self.local_rank = local_rank
+        self.normal_channel = normal_channel
+        self.additional_channel = 3 if self.normal_channel else 0
+
+        self.img_encoder = Img_Encoder()
+        if pre_train and img_model_path is not None:
+            pretrain_dict = torch.load(img_model_path)
+            img_model_dict = self.img_encoder.state_dict()
+            for k in list(pretrain_dict.keys()):
+                new_key = 'model.' + k
+                pretrain_dict[new_key] = pretrain_dict.pop(k)
+            pretrain_dict = {k: v for k, v in pretrain_dict.items() if k in img_model_dict}
+            img_model_dict.update(pretrain_dict)
+            self.img_encoder.load_state_dict(img_model_dict)
+
+        self.point_encoder = Point_Encoder(self.emb_dim, self.normal_channel, self.additional_channel, self.N_p)
+        self.affordance_dictionary_fusion = affordance_dictionary_fusion(self.emb_dim, self.proj_dim, self.num_heads)
+        self.img_text_fusion = img_text_fusion(self.emb_dim, self.proj_dim)
+        self.decoder = Decoder(self.additional_channel, self.emb_dim, self.proj_dim)
+
+        # visual-grounded reasoning chain (shared with offline L3)
+        self.visual_mhacot = VisualMHACoT(vlm_dim, emb_dim=self.emb_dim, num_heads=self.num_heads)
+
+    def encode_vlm(self, qwen_inputs):
+        '''
+        qwen_inputs: dict from the Qwen processor (input_ids, attention_mask,
+                     pixel_values, image_grid_thw, ...), already on device.
+        returns: V [B, Mmax, vlm_dim] (fp32), key_padding_mask [B, Mmax]
+        '''
+        out = self.vlm(**qwen_inputs, output_hidden_states=True, use_cache=False)
+        hidden = out.hidden_states[-1]                       # [B, T, D]
+        V, mask = _gather_image_tokens(hidden, qwen_inputs['input_ids'], self.image_token_id)
+        return V.float(), mask
+
+    def decode(self, img, xyz, V, vfeat_mask):
+        '''
+        img       : [B, 3, H, W]
+        xyz       : [B, 3, 2048]
+        V         : [B, M, vlm_dim]   image-token feature map
+        vfeat_mask: [B, M] bool, True = padded key position
+        returns:    (pred [B,2048,1], e_hk [B,emb], h_aff [B,emb])
+        '''
+        B, C, N = xyz.size()
+        F_I = self.img_encoder(img)
+        F_i = F_I.view(B, self.emb_dim, -1)
+
+        F_p_wise = self.point_encoder(xyz)
+
+        T_h, T_o, e_hk = self.visual_mhacot(V, key_padding_mask=vfeat_mask)
+
+        T_h_, T_o_ = self.affordance_dictionary_fusion(T_h, T_o)
+        I_h = self.img_text_fusion(F_i, T_h_)
+
+        pred, h_aff = self.decoder(T_o_, I_h.permute(0, 2, 1), F_p_wise, return_feat=True)
+        return pred, e_hk, h_aff
+
+    def forward(self, img, xyz, qwen_inputs):
+        '''Single-call convenience (eval): runs the vlm then decodes.'''
+        V, vfeat_mask = self.encode_vlm(qwen_inputs)
+        return self.decode(img, xyz, V, vfeat_mask)
+
+
+def get_GREAT_L3_LoRA(vlm, vlm_dim, image_token_id, img_model_path=None, pre_train=False,
+                      normal_channel=False, local_rank=None, N_p=64, emb_dim=512,
+                      proj_dim=512, num_heads=4):
+    model = GREAT_L3_LoRA(vlm, vlm_dim, image_token_id, img_model_path, pre_train,
+                          normal_channel, local_rank, N_p, emb_dim, proj_dim, num_heads)
     return model
 
 
